@@ -1,0 +1,1 @@
+export const success = (msg: string) => ({ success: true, message: msg });

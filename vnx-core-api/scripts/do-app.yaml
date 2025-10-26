@@ -1,0 +1,24 @@
+
+name: vnx-core-api
+services:
+  - name: core
+    github:
+      repo: visnec-global/VNX-Backend
+      branch: main
+    build_command: "pnpm install && pnpm build"
+    run_command: "pnpm start"
+    environment_slug: node-js
+    envs:
+      - key: SUPABASE_URL
+        scope: RUN_AND_BUILD_TIME
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        scope: RUN_AND_BUILD_TIME
+      - key: SUPABASE_ANON_KEY
+        scope: RUN_AND_BUILD_TIME
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 4000
+    http_port: 4000
+    instance_count: 1
+    instance_size_slug: basic-xxs

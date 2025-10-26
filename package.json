@@ -1,0 +1,7 @@
+
+{
+  "name": "vnx-backend-monorepo",
+  "private": true,
+  "workspaces": ["vnx-core-api/*"],
+  "scripts": { "dev": "ts-node vnx-core-api/core/index.ts" }
+}
