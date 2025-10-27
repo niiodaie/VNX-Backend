@@ -1,2 +1,2 @@
-# VNX Backend Monorepo
-Unified API hub for Visnec Global SaaS platform.
+# VNX Backend v2
+Monorepo for all Visnec Global backend APIs hosted on DigitalOcean.
