@@ -132,9 +132,20 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_season_entries_season ON season_entries(season_id, points DESC);
+
+  -- Distance tracking: daily meters walked
+  CREATE TABLE IF NOT EXISTS daily_distance (
+    user_id TEXT NOT NULL REFERENCES users(id),
+    date TEXT NOT NULL,
+    meters REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, date)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_daily_distance_user_date ON daily_distance(user_id, date);
 `);
 
 // Migrate: add display_name if upgrading from older schema
 try { db.exec('ALTER TABLE users ADD COLUMN display_name TEXT'); } catch { /* already exists */ }
+try { db.exec('ALTER TABLE player_stats ADD COLUMN total_meters REAL DEFAULT 0'); } catch { /* already exists */ }
 
 export default db;

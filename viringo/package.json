@@ -1,1 +1,16 @@
-{"name":"viringo-server","version":"1.0.0","type":"module","scripts":{"start":"npm run seed && node src/index.js","dev":"npm run seed && node --watch src/index.js","seed":"node src/seed.js"},"dependencies":{"better-sqlite3":"^11.6.0","cors":"^2.8.5","express":"^4.21.1","uuid":"^11.0.3"}}
+{
+  "name": "viringo-server",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "npm run seed && node src/index.js",
+    "dev": "npm run seed && node --watch src/index.js",
+    "seed": "node src/seed.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.6.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.1",
+    "uuid": "^11.0.3"
+  }
+}

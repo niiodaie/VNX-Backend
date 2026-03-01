@@ -78,7 +78,7 @@ function beastLevelFromXp(xp) {
 // Procedural spawn generation — called when a player enters an area with no active spawns.
 // Seeded RNG from grid-cell + calendar date for deterministic daily layouts.
 // Generates SPAWN_COUNT_PER_CELL spawns with staggered TTLs for natural rotation.
-function generateSpawnsNear(centerLat, centerLng) {
+const _generateSpawnsNearTx = db.transaction((centerLat, centerLng) => {
   const CELL = 0.005; // ~500 m grid
   const cellLat = Math.round(centerLat / CELL) * CELL;
   const cellLng = Math.round(centerLng / CELL) * CELL;
@@ -114,34 +114,36 @@ function generateSpawnsNear(centerLat, centerLng) {
   const activeSeason = getCurrentSeason();
   const hasLegendary = activeSeason && byRarity.legendary.length > 0;
 
+  const dailyDistance = getTodayDistance(null);
+  const bonusSpawns = dailyDistance >= 1000 ? Math.min(4, Math.floor(dailyDistance / 1000)) : 0;
+  const totalSpawns = SPAWN_COUNT_PER_CELL + bonusSpawns;
+
   const insert = db.prepare('INSERT INTO spawns (id, creature_id, lat, lng, expires_at) VALUES (?, ?, ?, ?, ?)');
 
-  const insertMany = db.transaction(() => {
-    for (let i = 0; i < SPAWN_COUNT_PER_CELL; i++) {
-      const angle = rand() * Math.PI * 2;
-      const dist  = rand() * 0.004 + 0.0005; // ~50–450 m from cell center
-      const spawnLat = centerLat + Math.cos(angle) * dist;
-      const spawnLng = centerLng + Math.sin(angle) * dist;
+  for (let i = 0; i < totalSpawns; i++) {
+    const angle = rand() * Math.PI * 2;
+    const dist  = rand() * 0.004 + 0.0005;
+    const spawnLat = centerLat + Math.cos(angle) * dist;
+    const spawnLng = centerLng + Math.sin(angle) * dist;
 
-      // Stagger expiry: base TTL ± 2 hours for natural turnover
-      const ttlMs = (SPAWN_TTL_HOURS + (rand() * 4 - 2)) * 60 * 60 * 1000;
-      const expires = toSqliteDatetime(new Date(Date.now() + ttlMs));
+    const ttlMs = (SPAWN_TTL_HOURS + (rand() * 4 - 2)) * 60 * 60 * 1000;
+    const expires = toSqliteDatetime(new Date(Date.now() + ttlMs));
 
-      // Rarity: 50% common, 25% uncommon, 17% rare, 8% legendary (if season active)
-      const r = rand();
-      let pool;
-      if (hasLegendary && r >= 0.92) pool = byRarity.legendary;
-      else if (r < 0.50) pool = byRarity.common;
-      else if (r < 0.75) pool = byRarity.uncommon;
-      else pool = byRarity.rare;
-      if (!pool || pool.length === 0) pool = byRarity.common;
+    const r = rand();
+    let pool;
+    if (hasLegendary && r >= 0.92) pool = byRarity.legendary;
+    else if (r < 0.50) pool = byRarity.common;
+    else if (r < 0.75) pool = byRarity.uncommon;
+    else pool = byRarity.rare;
+    if (!pool || pool.length === 0) pool = byRarity.common;
 
-      const picked = pool[Math.floor(rand() * pool.length)];
-      insert.run(uuid(), picked.id, spawnLat, spawnLng, expires);
-    }
-  });
+    const picked = pool[Math.floor(rand() * pool.length)];
+    insert.run(uuid(), picked.id, spawnLat, spawnLng, expires);
+  }
+});
 
-  insertMany();
+function generateSpawnsNear(centerLat, centerLng) {
+  _generateSpawnsNearTx(centerLat, centerLng);
 }
 
 function xpToLevel(xp) {
@@ -277,6 +279,9 @@ app.post('/catch', (req, res) => {
     if (!spawn) return res.status(404).json({ error: 'spawn not found' });
     creatureId = spawn.creature_id;
   }
+
+  const validCreature = db.prepare('SELECT id FROM creatures WHERE id = ?').get(creatureId);
+  if (!validCreature) return res.status(400).json({ error: 'invalid creature_id' });
 
   db.prepare('INSERT INTO catches (id, user_id, creature_id, spawn_id, lat, lng) VALUES (?, ?, ?, ?, ?, ?)')
     .run(uuid(), userId, creatureId, spawn_id || null, lat ?? null, lng ?? null);
@@ -615,15 +620,57 @@ app.get('/seasons/current/leaderboard', (req, res) => {
   res.json({ entries, userEntry });
 });
 
+// ── Haversine distance ──────────────────────────────────────
+
+function haversineMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+const MAX_SINGLE_UPDATE_METERS = 200;
+const MIN_UPDATE_METERS = 5;
+
+function getTodayDistance(userId) {
+  if (!userId) return 0;
+  const row = db.prepare('SELECT meters FROM daily_distance WHERE user_id = ? AND date = ?').get(userId, todayDate());
+  return row?.meters ?? 0;
+}
+
 // ── Presence (in-memory, ephemeral) ─────────────────────────
 
-const presenceMap = new Map(); // userId → { lat, lng, lastSeen, displayName, level }
-const PRESENCE_TTL_MS = 3 * 60 * 1000; // 3 minutes
+const presenceMap = new Map();
+const PRESENCE_TTL_MS = 3 * 60 * 1000;
 
 app.put('/me/presence', (req, res) => {
   const userId = getOrCreateUserId(req);
   const { lat, lng } = req.body || {};
   if (Number.isNaN(+lat) || Number.isNaN(+lng)) return res.status(400).json({ error: 'lat and lng required' });
+
+  const prev = presenceMap.get(userId);
+  let distanceDelta = 0;
+
+  if (prev && prev.lat != null && prev.lng != null) {
+    const d = haversineMeters(prev.lat, prev.lng, +lat, +lng);
+    if (d >= MIN_UPDATE_METERS && d <= MAX_SINGLE_UPDATE_METERS) {
+      distanceDelta = d;
+      const today = todayDate();
+      const existing = db.prepare('SELECT meters FROM daily_distance WHERE user_id = ? AND date = ?').get(userId, today);
+      if (existing) {
+        db.prepare('UPDATE daily_distance SET meters = meters + ? WHERE user_id = ? AND date = ?').run(distanceDelta, userId, today);
+      } else {
+        db.prepare('INSERT INTO daily_distance (user_id, date, meters) VALUES (?, ?, ?)').run(userId, today, distanceDelta);
+      }
+      db.prepare('UPDATE player_stats SET total_meters = total_meters + ? WHERE user_id = ?').run(distanceDelta, userId);
+      updateWalkQuestProgress(userId, distanceDelta);
+    }
+  }
+
   const user  = db.prepare('SELECT display_name FROM users WHERE id = ?').get(userId);
   const stats = db.prepare('SELECT level FROM player_stats WHERE user_id = ?').get(userId);
   presenceMap.set(userId, {
@@ -633,7 +680,7 @@ app.put('/me/presence', (req, res) => {
     displayName: user?.display_name || generateDisplayName(userId),
     level: stats?.level ?? 1,
   });
-  res.json({ ok: true });
+  res.json({ ok: true, distance_delta: Math.round(distanceDelta) });
 });
 
 app.get('/presence/nearby', (req, res) => {
@@ -653,6 +700,58 @@ app.get('/presence/nearby', (req, res) => {
     }
   }
   res.json(nearby);
+});
+
+// ── Walking quest progress ──────────────────────────────────
+
+function updateWalkQuestProgress(userId, deltaMeters) {
+  const date = todayDate();
+  ensureDailyQuests(userId, date);
+  const quests = db.prepare(`
+    SELECT dq.*, qd.type, qd.target_value, qd.required
+    FROM daily_quests dq
+    JOIN quest_defs qd ON qd.id = dq.quest_def_id
+    WHERE dq.user_id = ? AND dq.date = ? AND dq.claimed = 0 AND qd.type = 'walk_distance'
+  `).all(userId, date);
+
+  for (const q of quests) {
+    if (q.progress >= q.required) continue;
+    const newProgress = Math.min(q.required, q.progress + Math.round(deltaMeters));
+    db.prepare('UPDATE daily_quests SET progress = ? WHERE id = ?').run(newProgress, q.id);
+  }
+}
+
+// ── Distance endpoint ───────────────────────────────────────
+
+app.get('/me/distance', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.json({ today_meters: 0, total_meters: 0, milestones: [] });
+  const today = getTodayDistance(userId);
+  const stats = db.prepare('SELECT total_meters FROM player_stats WHERE user_id = ?').get(userId);
+  const total = stats?.total_meters ?? 0;
+
+  const DISTANCE_MILESTONES = [500, 1000, 2000, 5000, 10000];
+  const milestones = DISTANCE_MILESTONES.map((m) => ({
+    meters: m,
+    label: m >= 1000 ? `${m / 1000}km` : `${m}m`,
+    reached_today: today >= m,
+    reached_total: total >= m,
+  }));
+
+  res.json({ today_meters: Math.round(today), total_meters: Math.round(total), milestones });
+});
+
+// ── Health endpoint ─────────────────────────────────────────
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// ── Global error handler ────────────────────────────────────
+
+app.use((err, _req, res, _next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 const PORT = process.env.PORT || 3001;

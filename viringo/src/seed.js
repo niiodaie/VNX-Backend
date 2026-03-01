@@ -54,6 +54,16 @@ const evolutions = [
   { id: 'evo-ep-1', base_creature_id: 'ember-phoenix',    stage: 1, name: 'Ember Phoenix',    image_url: '/creatures/ember-phoenix.svg'    },
   // Eclipse Lord as standalone base
   { id: 'evo-el-1', base_creature_id: 'eclipse-lord',     stage: 1, name: 'Eclipse Lord',     image_url: '/creatures/eclipse-lord.svg'     },
+  // Self-referencing stage-1 entries for mid/late-chain creatures (so they're visible when caught directly)
+  { id: 'evo-mt-1', base_creature_id: 'moss-turtle',      stage: 1, name: 'Moss Turtle',      image_url: '/creatures/moss-turtle.svg'      },
+  { id: 'evo-av-1', base_creature_id: 'ancient-verdant',  stage: 1, name: 'Ancient Verdant',  image_url: '/creatures/ancient-verdant.svg'  },
+  { id: 'evo-bh2-1', base_creature_id: 'blaze-hound',    stage: 1, name: 'Blaze Hound',      image_url: '/creatures/blaze-hound.svg'      },
+  { id: 'evo-id-1', base_creature_id: 'inferno-drake',    stage: 1, name: 'Inferno Drake',    image_url: '/creatures/inferno-drake.svg'    },
+  { id: 'evo-ps-1', base_creature_id: 'prism-salamander', stage: 1, name: 'Prism Salamander', image_url: '/creatures/prism-salamander.svg' },
+  { id: 'evo-gt-1', base_creature_id: 'gem-titan',        stage: 1, name: 'Gem Titan',        image_url: '/creatures/gem-titan.svg'        },
+  { id: 'evo-gr-1', base_creature_id: 'gale-raptor',      stage: 1, name: 'Gale Raptor',      image_url: '/creatures/gale-raptor.svg'      },
+  { id: 'evo-ss-1', base_creature_id: 'storm-sovereign',  stage: 1, name: 'Storm Sovereign',  image_url: '/creatures/storm-sovereign.svg'  },
+  { id: 'evo-vp-1', base_creature_id: 'void-panther',     stage: 1, name: 'Void Panther',     image_url: '/creatures/void-panther.svg'     },
 ];
 
 // ── Quest definitions ────────────────────────────────────────
@@ -67,6 +77,10 @@ const questDefs = [
   { id: 'q-catch-fire',     title: 'Fire Starter',    description: 'Catch 2 fire-type beasts',   type: 'catch_type',   target_value: 'fire',     required: 2,  xp_reward: 90,  coin_reward: 18 },
   { id: 'q-catch-nature',   title: 'Into the Wild',   description: 'Catch 2 nature-type beasts', type: 'catch_type',   target_value: 'nature',   required: 2,  xp_reward: 90,  coin_reward: 18 },
   { id: 'q-catch-shadow',   title: 'Shadow Chaser',   description: 'Catch a shadow-type beast',  type: 'catch_type',   target_value: 'shadow',   required: 1,  xp_reward: 120, coin_reward: 25 },
+  // Walking / distance quests (meters)
+  { id: 'q-walk-500',       title: 'Warm Up',         description: 'Walk 500 meters',             type: 'walk_distance', target_value: null,      required: 500,  xp_reward: 60,  coin_reward: 12 },
+  { id: 'q-walk-1k',        title: 'Trail Runner',    description: 'Walk 1 kilometer',            type: 'walk_distance', target_value: null,      required: 1000, xp_reward: 120, coin_reward: 25 },
+  { id: 'q-walk-3k',        title: 'Explorer',        description: 'Walk 3 kilometers',           type: 'walk_distance', target_value: null,      required: 3000, xp_reward: 250, coin_reward: 50 },
 ];
 
 // ── Auto-rolling season (one per calendar month) ─────────────
