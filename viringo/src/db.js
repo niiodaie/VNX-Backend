@@ -7,6 +7,8 @@ const dbPath = process.env.DATABASE_PATH || join(__dirname, '..', 'data', 'creat
 
 const db = new Database(dbPath);
 
+db.pragma('journal_mode = WAL');
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -43,6 +45,7 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_spawns_lat_lng ON spawns(lat, lng);
+  CREATE INDEX IF NOT EXISTS idx_spawns_expires ON spawns(expires_at);
   CREATE INDEX IF NOT EXISTS idx_catches_user ON catches(user_id);
 
   -- Player stats: XP, coins, streak

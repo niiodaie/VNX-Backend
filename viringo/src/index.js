@@ -9,6 +9,12 @@ app.use(express.json());
 
 const DEFAULT_RADIUS_KM = 1.0;
 const LOCAL_LEADERBOARD_RADIUS_KM = 50;
+const SPAWN_COUNT_PER_CELL = 12;
+const SPAWN_TTL_HOURS = 6;
+
+function toSqliteDatetime(d) {
+  return d.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+}
 
 // Auto-generate a fun display name from the user's UUID
 const NAME_ADJ  = ['Ember','Breeze','Crystal','Shadow','Grove','Gale','Void','Prism','Storm','Inferno','Moss','Arcane'];
@@ -70,15 +76,13 @@ function beastLevelFromXp(xp) {
 }
 
 // Procedural spawn generation — called when a player enters an area with no active spawns.
-// Uses a seeded RNG from the grid-cell coordinates so the same area always produces
-// the same spawn layout on the same calendar day, but varies day-to-day.
+// Seeded RNG from grid-cell + calendar date for deterministic daily layouts.
+// Generates SPAWN_COUNT_PER_CELL spawns with staggered TTLs for natural rotation.
 function generateSpawnsNear(centerLat, centerLng) {
-  // Align to a ~500m grid cell so adjacent requests don't double-generate
-  const CELL = 0.005;
+  const CELL = 0.005; // ~500 m grid
   const cellLat = Math.round(centerLat / CELL) * CELL;
   const cellLng = Math.round(centerLng / CELL) * CELL;
 
-  // Skip if active spawns already exist in this cell
   const active = db.prepare(`
     SELECT COUNT(*) AS n FROM spawns
     WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?
@@ -86,14 +90,12 @@ function generateSpawnsNear(centerLat, centerLng) {
   `).get(cellLat - CELL, cellLat + CELL, cellLng - CELL, cellLng + CELL);
   if (active.n > 0) return;
 
-  // Purge stale expired spawns from this cell (keep DB clean)
   db.prepare(`
     DELETE FROM spawns
     WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?
     AND expires_at IS NOT NULL AND expires_at <= datetime('now')
   `).run(cellLat - CELL * 3, cellLat + CELL * 3, cellLng - CELL * 3, cellLng + CELL * 3);
 
-  // Seeded LCG — deterministic per cell + calendar date
   const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
   let seed = (Math.abs(Math.floor(cellLat * 10000)) * 31337 + Math.abs(Math.floor(cellLng * 10000)) * 13337 + parseInt(today)) >>> 0;
   function rand() {
@@ -109,31 +111,37 @@ function generateSpawnsNear(centerLat, centerLng) {
     legendary: allCreatures.filter(c => c.rarity === 'legendary'),
   };
 
-  // Check if there's an active season with an exclusive legendary creature
   const activeSeason = getCurrentSeason();
   const hasLegendary = activeSeason && byRarity.legendary.length > 0;
 
-  const expires = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
   const insert = db.prepare('INSERT INTO spawns (id, creature_id, lat, lng, expires_at) VALUES (?, ?, ?, ?, ?)');
 
-  for (let i = 0; i < 10; i++) {
-    const angle = rand() * Math.PI * 2;
-    const dist  = rand() * 0.004 + 0.0005; // ~50m–450m from cell center
-    const spawnLat = centerLat + Math.cos(angle) * dist;
-    const spawnLng = centerLng + Math.sin(angle) * dist;
+  const insertMany = db.transaction(() => {
+    for (let i = 0; i < SPAWN_COUNT_PER_CELL; i++) {
+      const angle = rand() * Math.PI * 2;
+      const dist  = rand() * 0.004 + 0.0005; // ~50–450 m from cell center
+      const spawnLat = centerLat + Math.cos(angle) * dist;
+      const spawnLng = centerLng + Math.sin(angle) * dist;
 
-    // Rarity weights: 55% common, 23% uncommon, 15% rare, 7% legendary (during active season)
-    const r = rand();
-    let pool;
-    if (hasLegendary && r >= 0.93) pool = byRarity.legendary;
-    else if (r < 0.55) pool = byRarity.common;
-    else if (r < 0.78) pool = byRarity.uncommon;
-    else pool = byRarity.rare;
-    if (!pool || pool.length === 0) pool = byRarity.common;
-    const picked = pool[Math.floor(rand() * pool.length)];
+      // Stagger expiry: base TTL ± 2 hours for natural turnover
+      const ttlMs = (SPAWN_TTL_HOURS + (rand() * 4 - 2)) * 60 * 60 * 1000;
+      const expires = toSqliteDatetime(new Date(Date.now() + ttlMs));
 
-    insert.run(uuid(), picked.id, spawnLat, spawnLng, expires);
-  }
+      // Rarity: 50% common, 25% uncommon, 17% rare, 8% legendary (if season active)
+      const r = rand();
+      let pool;
+      if (hasLegendary && r >= 0.92) pool = byRarity.legendary;
+      else if (r < 0.50) pool = byRarity.common;
+      else if (r < 0.75) pool = byRarity.uncommon;
+      else pool = byRarity.rare;
+      if (!pool || pool.length === 0) pool = byRarity.common;
+
+      const picked = pool[Math.floor(rand() * pool.length)];
+      insert.run(uuid(), picked.id, spawnLat, spawnLng, expires);
+    }
+  });
+
+  insertMany();
 }
 
 function xpToLevel(xp) {
@@ -272,6 +280,11 @@ app.post('/catch', (req, res) => {
 
   db.prepare('INSERT INTO catches (id, user_id, creature_id, spawn_id, lat, lng) VALUES (?, ?, ?, ?, ?, ?)')
     .run(uuid(), userId, creatureId, spawn_id || null, lat ?? null, lng ?? null);
+
+  // Remove the spawn so it can't be caught again
+  if (spawn_id) {
+    db.prepare('DELETE FROM spawns WHERE id = ?').run(spawn_id);
+  }
 
   const creature = db.prepare('SELECT id, name, image_url, rarity, type FROM creatures WHERE id = ?').get(creatureId);
   const xp = XP_PER_CATCH[creature.rarity] ?? 20;
