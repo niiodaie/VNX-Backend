@@ -1,5 +1,39 @@
 
+import express from 'express';
+import cors from 'cors';
+import { v4 as uuid } from 'uuid';
+import db from './db.js';
 
+const app = express();
+
+// Allow configured frontends; default to known production/staging domains.
+const defaultOrigins = [
+  'https://viringo.pro',
+  'https://www.viringo.pro',
+  'https://viringo.visnec.com',
+  'https://viringo.vercel.app',
+];
+
+const allowedOrigins = process.env.FRONTEND_ORIGIN
+  ? process.env.FRONTEND_ORIGIN.split(',').map((o) => o.trim())
+  : defaultOrigins;
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // Allow same-origin / curl / server-to-server (no Origin header),
+      // and any origin explicitly listed above.
+      if (!origin || allowedOrigins.includes(origin)) {
+        cb(null, true);
+      } else {
+        cb(null, false);
+      }
+    },
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  }),
+);
+
+app.use(express.json());
 
 
 const DEFAULT_RADIUS_KM = 1.0;
