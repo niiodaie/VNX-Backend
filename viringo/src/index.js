@@ -3,16 +3,7 @@ import cors from 'cors';
 import { v4 as uuid } from 'uuid';
 import db from './db.js';
 
-const app = express();
-const allowedOrigins = process.env.FRONTEND_ORIGIN
-  ? process.env.FRONTEND_ORIGIN.split(',').map(o => o.trim())
-  : null;
-app.use(cors({
-  origin: allowedOrigins
-    ? (origin, cb) => cb(null, !origin || allowedOrigins.includes(origin))
-    : true,
-}));
-app.use(express.json());
+
 
 const DEFAULT_RADIUS_KM = 1.0;
 const LOCAL_LEADERBOARD_RADIUS_KM = 50;
