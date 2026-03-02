@@ -1,7 +1,11 @@
+import { createRequire } from 'node:module';
 import express from 'express';
 import cors from 'cors';
 import { v4 as uuid } from 'uuid';
 import db from './db.js';
+
+const require = createRequire(import.meta.url);
+const { version: API_VERSION } = require('../package.json');
 
 const app = express();
 
@@ -116,7 +120,7 @@ function beastLevelFromXp(xp) {
 // Procedural spawn generation — called when a player enters an area with no active spawns.
 // Seeded RNG from grid-cell + calendar date for deterministic daily layouts.
 // Generates SPAWN_COUNT_PER_CELL spawns with staggered TTLs for natural rotation.
-const _generateSpawnsNearTx = db.transaction((centerLat, centerLng) => {
+const _generateSpawnsNearTx = db.transaction((centerLat, centerLng, userId) => {
   const CELL = 0.005; // ~500 m grid
   const cellLat = Math.round(centerLat / CELL) * CELL;
   const cellLng = Math.round(centerLng / CELL) * CELL;
@@ -133,6 +137,12 @@ const _generateSpawnsNearTx = db.transaction((centerLat, centerLng) => {
     WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?
     AND expires_at IS NOT NULL AND expires_at <= datetime('now')
   `).run(cellLat - CELL * 3, cellLat + CELL * 3, cellLng - CELL * 3, cellLng + CELL * 3);
+
+  const effects = getActiveEffects(userId);
+  const dailyDistance = getTodayDistance(userId);
+  const baseCount = SPAWN_COUNT_PER_CELL * (effects.lure ? 2 : 1);
+  const bonusSpawns = dailyDistance >= 1000 ? Math.min(4, Math.floor(dailyDistance / 1000)) : 0;
+  const totalSpawns = baseCount + bonusSpawns;
 
   const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
   let seed = (Math.abs(Math.floor(cellLat * 10000)) * 31337 + Math.abs(Math.floor(cellLng * 10000)) * 13337 + parseInt(today)) >>> 0;
@@ -151,10 +161,7 @@ const _generateSpawnsNearTx = db.transaction((centerLat, centerLng) => {
 
   const activeSeason = getCurrentSeason();
   const hasLegendary = activeSeason && byRarity.legendary.length > 0;
-
-  const dailyDistance = getTodayDistance(null);
-  const bonusSpawns = dailyDistance >= 1000 ? Math.min(4, Math.floor(dailyDistance / 1000)) : 0;
-  const totalSpawns = SPAWN_COUNT_PER_CELL + bonusSpawns;
+  const incense = effects.incense;
 
   const insert = db.prepare('INSERT INTO spawns (id, creature_id, lat, lng, expires_at) VALUES (?, ?, ?, ?, ?)');
 
@@ -169,7 +176,11 @@ const _generateSpawnsNearTx = db.transaction((centerLat, centerLng) => {
 
     const r = rand();
     let pool;
-    if (hasLegendary && r >= 0.92) pool = byRarity.legendary;
+    if (incense && hasLegendary && r >= 0.70) pool = byRarity.legendary;
+    else if (incense && r >= 0.85) pool = byRarity.rare;
+    else if (incense && r >= 0.55) pool = byRarity.uncommon;
+    else if (incense) pool = byRarity.common;
+    else if (hasLegendary && r >= 0.92) pool = byRarity.legendary;
     else if (r < 0.50) pool = byRarity.common;
     else if (r < 0.75) pool = byRarity.uncommon;
     else pool = byRarity.rare;
@@ -180,8 +191,8 @@ const _generateSpawnsNearTx = db.transaction((centerLat, centerLng) => {
   }
 });
 
-function generateSpawnsNear(centerLat, centerLng) {
-  _generateSpawnsNearTx(centerLat, centerLng);
+function generateSpawnsNear(centerLat, centerLng, userId = null) {
+  _generateSpawnsNearTx(centerLat, centerLng, userId);
 }
 
 function xpToLevel(xp) {
@@ -297,10 +308,11 @@ app.get('/spawns', (req, res) => {
   const lng = parseFloat(req.query.lng);
   const radiusKm = parseFloat(req.query.radius) || DEFAULT_RADIUS_KM;
   if (Number.isNaN(lat) || Number.isNaN(lng)) return res.status(400).json({ error: 'lat and lng required' });
+  const userId = req.headers['x-user-id'] || null;
   const d = radiusKm / 111;
   let rows = spawnQuery.all(lat - d, lat + d, lng - d, lng + d);
   if (rows.length === 0) {
-    generateSpawnsNear(lat, lng);
+    generateSpawnsNear(lat, lng, userId);
     rows = spawnQuery.all(lat - d, lat + d, lng - d, lng + d);
   }
   res.json(rows);
@@ -330,7 +342,8 @@ app.post('/catch', (req, res) => {
   }
 
   const creature = db.prepare('SELECT id, name, image_url, rarity, type FROM creatures WHERE id = ?').get(creatureId);
-  const xp = XP_PER_CATCH[creature.rarity] ?? 20;
+  let xp = XP_PER_CATCH[creature.rarity] ?? 20;
+  if (getActiveEffects(userId).lucky_charm) xp *= 2;
   const statsUpdate = awardXP(userId, xp);
   updateQuestProgress(userId, creature);
 
@@ -370,7 +383,38 @@ app.post('/catch', (req, res) => {
   }
   const canEvolve = (EVOLVE_LEVELS[beastInstance.stage] ?? Infinity) <= beastInstance.level;
 
-  res.status(201).json({ creature, user_id: userId, ...statsUpdate, beastInstance, canEvolve, seasonPoints });
+  const updatedStats = getOrCreateStats(userId);
+  res.status(201).json({ creature, user_id: userId, ...statsUpdate, coins: updatedStats.coins, beastInstance, canEvolve, seasonPoints });
+});
+
+app.get('/me/bestiary', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  const creatures = db.prepare('SELECT id, name, image_url, rarity, type FROM creatures').all();
+  if (!userId) return res.json(creatures.map(c => ({ ...c, discovered: false, total_caught: 0, first_caught_at: null, beast_stage: null, beast_level: null })));
+
+  const catchesByCreature = db.prepare(`
+    SELECT creature_id, COUNT(*) AS total_caught, MIN(caught_at) AS first_caught_at
+    FROM catches WHERE user_id = ? GROUP BY creature_id
+  `).all(userId);
+  const catchMap = Object.fromEntries(catchesByCreature.map(r => [r.creature_id, { total_caught: r.total_caught, first_caught_at: r.first_caught_at }]));
+
+  const beasts = db.prepare('SELECT base_creature_id, stage, level FROM beast_instances WHERE user_id = ?').all(userId);
+  const beastMap = Object.fromEntries(beasts.map(b => [b.base_creature_id, { stage: b.stage, level: b.level }]));
+
+  const entries = creatures.map(c => {
+    const caught = catchMap[c.id];
+    const total_caught = caught?.total_caught ?? 0;
+    const beast = beastMap[c.id];
+    return {
+      ...c,
+      discovered: total_caught > 0,
+      total_caught,
+      first_caught_at: caught?.first_caught_at ?? null,
+      beast_stage: beast?.stage ?? null,
+      beast_level: beast?.level ?? null,
+    };
+  });
+  res.json(entries);
 });
 
 app.get('/me/collection', (req, res) => {
@@ -680,6 +724,19 @@ function getTodayDistance(userId) {
   return row?.meters ?? 0;
 }
 
+function getActiveEffects(userId) {
+  if (!userId) return { lure: false, incense: false, lucky_charm: false };
+  const rows = db.prepare(
+    "SELECT effect_type FROM active_effects WHERE user_id = ? AND expires_at > datetime('now')"
+  ).all(userId);
+  const set = new Set(rows.map((r) => r.effect_type));
+  return {
+    lure: set.has('lure'),
+    incense: set.has('incense'),
+    lucky_charm: set.has('lucky_charm'),
+  };
+}
+
 // ── Presence (in-memory, ephemeral) ─────────────────────────
 
 const presenceMap = new Map();
@@ -779,10 +836,700 @@ app.get('/me/distance', (req, res) => {
   res.json({ today_meters: Math.round(today), total_meters: Math.round(total), milestones });
 });
 
+// ── Shop ────────────────────────────────────────────────────
+
+app.get('/shop/items', (req, res) => {
+  const items = db.prepare('SELECT id, name, description, price, effect_type, duration_min, image_url FROM shop_items').all();
+  res.json(items);
+});
+
+app.post('/shop/buy', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'no user' });
+  const { item_id } = req.body || {};
+  if (!item_id) return res.status(400).json({ error: 'item_id required' });
+
+  const item = db.prepare('SELECT * FROM shop_items WHERE id = ?').get(item_id);
+  if (!item) return res.status(404).json({ error: 'item not found' });
+
+  const stats = getOrCreateStats(userId);
+  if (stats.coins < item.price) return res.status(400).json({ error: 'not enough coins' });
+
+  db.prepare('UPDATE player_stats SET coins = coins - ?, updated_at = datetime(\'now\') WHERE user_id = ?').run(item.price, userId);
+  const existing = db.prepare('SELECT id, quantity FROM inventory WHERE user_id = ? AND item_id = ?').get(userId, item_id);
+  if (existing) {
+    db.prepare('UPDATE inventory SET quantity = quantity + 1 WHERE id = ?').run(existing.id);
+  } else {
+    db.prepare('INSERT INTO inventory (id, user_id, item_id, quantity) VALUES (?, ?, ?, 1)').run(uuid(), userId, item_id);
+  }
+  const updated = getOrCreateStats(userId);
+  res.json({ ok: true, coins: updated.coins });
+});
+
+app.get('/me/inventory', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.json([]);
+  const rows = db.prepare(`
+    SELECT inv.id, inv.item_id, inv.quantity, si.name, si.description, si.effect_type, si.duration_min
+    FROM inventory inv JOIN shop_items si ON si.id = inv.item_id
+    WHERE inv.user_id = ? AND inv.quantity > 0
+  `).all(userId);
+  res.json(rows);
+});
+
+app.post('/me/inventory/:itemId/use', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'no user' });
+  const itemId = req.params.itemId;
+
+  const inv = db.prepare('SELECT inv.*, si.effect_type, si.duration_min FROM inventory inv JOIN shop_items si ON si.id = inv.item_id WHERE inv.user_id = ? AND inv.item_id = ?').get(userId, itemId);
+  if (!inv || inv.quantity < 1) return res.status(404).json({ error: 'item not in inventory or quantity 0' });
+
+  if (inv.effect_type === 'rare_egg') {
+    const uncommonPlus = db.prepare("SELECT id FROM creatures WHERE rarity IN ('uncommon','rare','legendary')").all();
+    if (uncommonPlus.length === 0) return res.status(500).json({ error: 'no creatures for egg' });
+    const picked = uncommonPlus[Math.floor(Math.random() * uncommonPlus.length)];
+    const creatureId = picked.id;
+    const creature = db.prepare('SELECT id, name, image_url, rarity, type FROM creatures WHERE id = ?').get(creatureId);
+    db.prepare('INSERT INTO catches (id, user_id, creature_id, spawn_id, lat, lng) VALUES (?, ?, ?, ?, ?, ?)').run(uuid(), userId, creatureId, null, null, null);
+    const existingBeast = db.prepare('SELECT * FROM beast_instances WHERE user_id = ? AND base_creature_id = ?').get(userId, creatureId);
+    if (existingBeast) {
+      const newXp = Math.min(existingBeast.beast_xp + BEAST_XP_PER_CATCH, (MAX_BEAST_LEVEL - 1) * BEAST_XP_PER_LEVEL);
+      const newLevel = beastLevelFromXp(newXp);
+      db.prepare('UPDATE beast_instances SET beast_xp = ?, level = ? WHERE id = ?').run(newXp, newLevel, existingBeast.id);
+    } else {
+      db.prepare('INSERT INTO beast_instances (id, user_id, base_creature_id, stage, level, beast_xp) VALUES (?, ?, ?, 1, ?, ?)').run(uuid(), userId, creatureId, beastLevelFromXp(BEAST_XP_PER_CATCH), BEAST_XP_PER_CATCH);
+    }
+    db.prepare('UPDATE inventory SET quantity = quantity - 1 WHERE id = ?').run(inv.id);
+    return res.json({ ok: true, effect_type: 'rare_egg', creature });
+  }
+
+  const durationMin = inv.duration_min ?? 30;
+  const expiresAt = toSqliteDatetime(new Date(Date.now() + durationMin * 60 * 1000));
+  db.prepare('INSERT INTO active_effects (id, user_id, effect_type, expires_at) VALUES (?, ?, ?, ?)').run(uuid(), userId, inv.effect_type, expiresAt);
+  db.prepare('UPDATE inventory SET quantity = quantity - 1 WHERE id = ?').run(inv.id);
+  res.json({ ok: true, effect_type: inv.effect_type, expires_at: expiresAt, duration_min: durationMin });
+});
+
+app.get('/me/effects', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.json([]);
+  const rows = db.prepare(
+    "SELECT effect_type, expires_at FROM active_effects WHERE user_id = ? AND expires_at > datetime('now')"
+  ).all(userId);
+  res.json(rows.map((r) => ({ effect_type: r.effect_type, expires_at: r.expires_at })));
+});
+
+// ── Friends (social) ─────────────────────────────────────────
+
+app.get('/me/friends', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.json([]);
+  const rows = db.prepare(`
+    SELECT f.friend_id AS user_id, u.display_name
+    FROM friends f
+    JOIN users u ON u.id = f.friend_id
+    WHERE f.user_id = ?
+    ORDER BY f.created_at DESC
+  `).all(userId);
+  res.json(rows);
+});
+
+app.post('/me/friends', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'no user' });
+  const { friend_user_id } = req.body || {};
+  if (!friend_user_id) return res.status(400).json({ error: 'friend_user_id required' });
+  if (friend_user_id === userId) return res.status(400).json({ error: 'cannot add yourself' });
+
+  const friendExists = db.prepare('SELECT id FROM users WHERE id = ?').get(friend_user_id);
+  if (!friendExists) return res.status(404).json({ error: 'user not found' });
+
+  try {
+    db.prepare('INSERT INTO friends (id, user_id, friend_id) VALUES (?, ?, ?)').run(uuid(), userId, friend_user_id);
+  } catch (e) {
+    if (e.code === 'SQLITE_CONSTRAINT' && e.message.includes('UNIQUE')) return res.status(409).json({ error: 'already friends' });
+    throw e;
+  }
+
+  const friend = db.prepare('SELECT id, display_name FROM users WHERE id = ?').get(friend_user_id);
+  res.status(201).json({ user_id: friend.id, display_name: friend.display_name });
+});
+
+app.delete('/me/friends/:friendUserId', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'no user' });
+  const { friendUserId } = req.params;
+  db.prepare('DELETE FROM friends WHERE user_id = ? AND friend_id = ?').run(userId, friendUserId);
+  res.status(204).send();
+});
+
+app.post('/me/friends/:friendUserId/gift', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'no user' });
+  const { friendUserId } = req.params;
+  const { item_id } = req.body || {};
+  if (!item_id) return res.status(400).json({ error: 'item_id required' });
+
+  const friendship = db.prepare('SELECT 1 FROM friends WHERE user_id = ? AND friend_id = ?').get(userId, friendUserId);
+  if (!friendship) return res.status(403).json({ error: 'not friends with this user' });
+
+  const inv = db.prepare('SELECT inv.* FROM inventory inv WHERE inv.user_id = ? AND inv.item_id = ?').get(userId, item_id);
+  if (!inv || inv.quantity < 1) return res.status(404).json({ error: 'item not in inventory or quantity 0' });
+
+  const friendExists = db.prepare('SELECT id FROM users WHERE id = ?').get(friendUserId);
+  if (!friendExists) return res.status(404).json({ error: 'friend not found' });
+
+  if (inv.quantity <= 1) {
+    db.prepare('DELETE FROM inventory WHERE id = ?').run(inv.id);
+  } else {
+    db.prepare('UPDATE inventory SET quantity = quantity - 1 WHERE id = ?').run(inv.id);
+  }
+
+  const friendInv = db.prepare('SELECT id, quantity FROM inventory WHERE user_id = ? AND item_id = ?').get(friendUserId, item_id);
+  if (friendInv) {
+    db.prepare('UPDATE inventory SET quantity = quantity + 1 WHERE id = ?').run(friendInv.id);
+  } else {
+    db.prepare('INSERT INTO inventory (id, user_id, item_id, quantity) VALUES (?, ?, ?, 1)').run(uuid(), friendUserId, item_id);
+  }
+
+  res.json({ ok: true, item_id });
+});
+
+// ── Battle (in-memory state) ─────────────────────────────────
+
+const WILD_LEVEL_BY_RARITY = { common: 3, uncommon: 6, rare: 9, legendary: 12 };
+
+function battleStats(level, stage) {
+  return {
+    hp: level * 10 + stage * 15,
+    atk: level * 2 + stage * 5,
+    def: level + stage * 3,
+  };
+}
+
+function battleDamage(atk, def) {
+  return Math.max(1, Math.floor(atk - def / 2));
+}
+
+const battleMap = new Map();
+
+const BATTLE_TTL_MS = 10 * 60 * 1000;
+
+function pruneExpiredBattles() {
+  const now = Date.now();
+  for (const [id, b] of battleMap) {
+    if (now - b.createdAt > BATTLE_TTL_MS) battleMap.delete(id);
+  }
+}
+
+app.post('/battle/start', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'no user' });
+  const { spawn_id, beast_id } = req.body || {};
+  if (!spawn_id || !beast_id) return res.status(400).json({ error: 'spawn_id and beast_id required' });
+
+  const spawn = db.prepare('SELECT id, creature_id, lat, lng FROM spawns WHERE id = ?').get(spawn_id);
+  if (!spawn) return res.status(404).json({ error: 'spawn not found' });
+
+  const beast = db.prepare(`
+    SELECT bi.*, ce.name AS current_name, ce.image_url AS current_image
+    FROM beast_instances bi
+    JOIN creature_evolutions ce ON ce.base_creature_id = bi.base_creature_id AND ce.stage = bi.stage
+    WHERE bi.id = ? AND bi.user_id = ?
+  `).get(beast_id, userId);
+  if (!beast) return res.status(404).json({ error: 'beast not found' });
+
+  const wildCreature = db.prepare('SELECT id, name, image_url, rarity, type FROM creatures WHERE id = ?').get(spawn.creature_id);
+  if (!wildCreature) return res.status(400).json({ error: 'creature not found' });
+
+  const wildLevel = WILD_LEVEL_BY_RARITY[wildCreature.rarity] ?? 3;
+  const playerStats = battleStats(beast.level, beast.stage);
+  const wildStats = battleStats(wildLevel, 1);
+
+  const battleId = uuid();
+  const battle = {
+    battleId,
+    userId,
+    beastId: beast.id,
+    spawnId: spawn_id,
+    wildCreatureId: spawn.creature_id,
+    playerHP: playerStats.hp,
+    playerMaxHP: playerStats.hp,
+    wildHP: wildStats.hp,
+    wildMaxHP: wildStats.hp,
+    playerAtk: playerStats.atk,
+    playerDef: playerStats.def,
+    wildAtk: wildStats.atk,
+    wildDef: wildStats.def,
+    healCount: 0,
+    createdAt: Date.now(),
+  };
+  battleMap.set(battleId, battle);
+  pruneExpiredBattles();
+
+  res.json({
+    battle_id: battleId,
+    player_hp: battle.playerHP,
+    player_max_hp: battle.playerMaxHP,
+    wild_hp: battle.wildHP,
+    wild_max_hp: battle.wildMaxHP,
+    wild_creature: wildCreature,
+    beast_name: beast.current_name,
+    beast_image: beast.current_image,
+  });
+});
+
+app.post('/battle/turn', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'no user' });
+  const { battle_id, action } = req.body || {};
+  if (!battle_id || !action) return res.status(400).json({ error: 'battle_id and action required' });
+  if (!['attack', 'power', 'heal'].includes(action)) return res.status(400).json({ error: 'action must be attack, power, or heal' });
+
+  const battle = battleMap.get(battle_id);
+  if (!battle || battle.userId !== userId) return res.status(404).json({ error: 'battle not found' });
+
+  const log = [];
+
+  if (action === 'heal') {
+    if (battle.healCount >= 2) return res.status(400).json({ error: 'no heals left' });
+    const amount = Math.floor(battle.playerMaxHP * 0.3);
+    battle.playerHP = Math.min(battle.playerMaxHP, battle.playerHP + amount);
+    battle.healCount++;
+    log.push(`You heal for ${amount} HP.`);
+  } else {
+    let damage = battleDamage(battle.playerAtk, battle.wildDef);
+    if (action === 'power') {
+      if (Math.random() > 0.7) {
+        damage = 0;
+        log.push('Power Strike missed!');
+      } else {
+        damage = Math.floor(damage * 1.5);
+        log.push(`Power Strike hits for ${damage} damage!`);
+      }
+    } else {
+      log.push(`You attack for ${damage} damage!`);
+    }
+    if (damage > 0) {
+      battle.wildHP = Math.max(0, battle.wildHP - damage);
+    }
+  }
+
+  let result = null;
+  if (battle.wildHP <= 0) {
+    battleMap.delete(battle_id);
+    const wildCreature = db.prepare('SELECT id, name, image_url, rarity, type FROM creatures WHERE id = ?').get(battle.wildCreatureId);
+    const xp = (XP_PER_CATCH[wildCreature.rarity] ?? 20) * 2;
+    const bonusCoins = { common: 5, uncommon: 10, rare: 20, legendary: 40 }[wildCreature.rarity] ?? 5;
+    db.prepare('DELETE FROM spawns WHERE id = ?').run(battle.spawnId);
+    db.prepare('INSERT INTO catches (id, user_id, creature_id, spawn_id, lat, lng) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(uuid(), userId, battle.wildCreatureId, battle.spawnId, null, null);
+    const creature = db.prepare('SELECT id, name, image_url, rarity, type FROM creatures WHERE id = ?').get(battle.wildCreatureId);
+    updateQuestProgress(userId, creature);
+    awardXP(userId, xp);
+    const stats = getOrCreateStats(userId);
+    db.prepare('UPDATE player_stats SET coins = coins + ? WHERE user_id = ?').run(bonusCoins, userId);
+    const existingBeast = db.prepare('SELECT * FROM beast_instances WHERE user_id = ? AND base_creature_id = ?').get(userId, battle.wildCreatureId);
+    if (existingBeast) {
+      const newXp = Math.min(existingBeast.beast_xp + BEAST_XP_PER_CATCH, (MAX_BEAST_LEVEL - 1) * BEAST_XP_PER_LEVEL);
+      db.prepare('UPDATE beast_instances SET beast_xp = ?, level = ? WHERE id = ?').run(newXp, beastLevelFromXp(newXp), existingBeast.id);
+    } else {
+      db.prepare('INSERT INTO beast_instances (id, user_id, base_creature_id, stage, level, beast_xp) VALUES (?, ?, ?, 1, ?, ?)')
+        .run(uuid(), userId, battle.wildCreatureId, beastLevelFromXp(BEAST_XP_PER_CATCH), BEAST_XP_PER_CATCH);
+    }
+    result = { winner: 'player', xp, coins: bonusCoins, creature: wildCreature };
+  } else {
+    const wildDamage = battleDamage(battle.wildAtk, battle.playerDef);
+    battle.playerHP = Math.max(0, battle.playerHP - wildDamage);
+    log.push(`Wild attacks for ${wildDamage} damage!`);
+
+    if (battle.playerHP <= 0) {
+      battleMap.delete(battle_id);
+      result = { winner: 'wild' };
+    }
+  }
+
+  res.json({
+    player_hp: battle.playerHP,
+    player_max_hp: battle.playerMaxHP,
+    wild_hp: battle.wildHP,
+    wild_max_hp: battle.wildMaxHP,
+    log,
+    result,
+  });
+});
+
+// ── PvP Battle (instant AI or real 2P with challenge/accept) ─────
+
+const pvpBattleMap = new Map();
+const pvpChallengesMap = new Map();
+const CHALLENGE_TTL_MS = 15 * 60 * 1000;
+
+function pruneExpiredPvpBattles() {
+  const now = Date.now();
+  for (const [id, b] of pvpBattleMap) {
+    if (now - b.createdAt > BATTLE_TTL_MS) pvpBattleMap.delete(id);
+  }
+}
+function pruneExpiredChallenges() {
+  const now = Date.now();
+  for (const [id, c] of pvpChallengesMap) {
+    if (now - c.createdAt > CHALLENGE_TTL_MS) pvpChallengesMap.delete(id);
+  }
+}
+
+function pickOpponentAction(battle) {
+  const canHeal = battle.opponentHealCount < 2 && battle.opponentHP < battle.opponentMaxHP;
+  const choices = ['attack', 'power'];
+  if (canHeal) choices.push('heal');
+  return choices[Math.floor(Math.random() * choices.length)];
+}
+
+// Instant PvP (opponent is AI) — unchanged
+app.post('/battle/pvp/challenge', (req, res) => {
+  const challengerId = req.headers['x-user-id'];
+  if (!challengerId) return res.status(401).json({ error: 'no user' });
+  const { opponent_user_id, my_beast_id } = req.body || {};
+  if (!opponent_user_id || !my_beast_id) return res.status(400).json({ error: 'opponent_user_id and my_beast_id required' });
+  if (opponent_user_id === challengerId) return res.status(400).json({ error: 'cannot challenge yourself' });
+
+  const myBeast = db.prepare(`
+    SELECT bi.*, ce.name AS current_name, ce.image_url AS current_image
+    FROM beast_instances bi
+    JOIN creature_evolutions ce ON ce.base_creature_id = bi.base_creature_id AND ce.stage = bi.stage
+    WHERE bi.id = ? AND bi.user_id = ?
+  `).get(my_beast_id, challengerId);
+  if (!myBeast) return res.status(404).json({ error: 'beast not found' });
+
+  const opponentBeasts = db.prepare(`
+    SELECT bi.id, bi.base_creature_id, bi.stage, bi.level, ce.name AS current_name, ce.image_url AS current_image
+    FROM beast_instances bi
+    JOIN creature_evolutions ce ON ce.base_creature_id = bi.base_creature_id AND ce.stage = bi.stage
+    WHERE bi.user_id = ?
+  `).all(opponent_user_id);
+  if (!opponentBeasts.length) return res.status(400).json({ error: 'opponent has no beasts' });
+
+  const opponentBeast = opponentBeasts[Math.floor(Math.random() * opponentBeasts.length)];
+  const creature = db.prepare('SELECT id, name, image_url, rarity, type FROM creatures WHERE id = ?').get(opponentBeast.base_creature_id);
+  if (!creature) return res.status(400).json({ error: 'creature not found' });
+
+  const myStats = battleStats(myBeast.level, myBeast.stage);
+  const oppStats = battleStats(opponentBeast.level, opponentBeast.stage);
+
+  const battleId = uuid();
+  const battle = {
+    battleId,
+    challengerId,
+    opponentId: opponent_user_id,
+    myBeastId: myBeast.id,
+    opponentBeastId: opponentBeast.id,
+    myHP: myStats.hp,
+    myMaxHP: myStats.hp,
+    opponentHP: oppStats.hp,
+    opponentMaxHP: oppStats.hp,
+    myAtk: myStats.atk,
+    myDef: myStats.def,
+    opponentAtk: oppStats.atk,
+    opponentDef: oppStats.def,
+    myHealCount: 0,
+    opponentHealCount: 0,
+    createdAt: Date.now(),
+  };
+  pvpBattleMap.set(battleId, battle);
+  pruneExpiredPvpBattles();
+
+  res.json({
+    battle_id: battleId,
+    player_hp: battle.myHP,
+    player_max_hp: battle.myMaxHP,
+    wild_hp: battle.opponentHP,
+    wild_max_hp: battle.opponentMaxHP,
+    wild_creature: { ...creature, name: opponentBeast.current_name, image_url: opponentBeast.current_image },
+    beast_name: myBeast.current_name,
+    beast_image: myBeast.current_image,
+  });
+});
+
+// Real 2P: request challenge (pending until opponent accepts)
+app.post('/battle/pvp/request', (req, res) => {
+  const challengerId = req.headers['x-user-id'];
+  if (!challengerId) return res.status(401).json({ error: 'no user' });
+  const { opponent_user_id, my_beast_id } = req.body || {};
+  if (!opponent_user_id || !my_beast_id) return res.status(400).json({ error: 'opponent_user_id and my_beast_id required' });
+  if (opponent_user_id === challengerId) return res.status(400).json({ error: 'cannot challenge yourself' });
+
+  const myBeast = db.prepare(`
+    SELECT bi.*, ce.name AS current_name, ce.image_url AS current_image
+    FROM beast_instances bi
+    JOIN creature_evolutions ce ON ce.base_creature_id = bi.base_creature_id AND ce.stage = bi.stage
+    WHERE bi.id = ? AND bi.user_id = ?
+  `).get(my_beast_id, challengerId);
+  if (!myBeast) return res.status(404).json({ error: 'beast not found' });
+
+  const oppUser = db.prepare('SELECT id FROM users WHERE id = ?').get(opponent_user_id);
+  if (!oppUser) return res.status(404).json({ error: 'opponent not found' });
+
+  const challengeId = uuid();
+  pvpChallengesMap.set(challengeId, {
+    challengeId,
+    challengerId,
+    opponentId: opponent_user_id,
+    challengerBeastId: myBeast.id,
+    challengerBeastName: myBeast.current_name,
+    challengerBeastImage: myBeast.current_image,
+    status: 'pending',
+    createdAt: Date.now(),
+  });
+  pruneExpiredChallenges();
+  res.status(201).json({ challenge_id: challengeId });
+});
+
+app.get('/me/pvp/challenges', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.json({ incoming: [], outgoing: [] });
+  const incoming = [];
+  const outgoing = [];
+  for (const [cid, c] of pvpChallengesMap) {
+    if (c.opponentId === userId && c.status === 'pending') {
+      const challengerName = db.prepare('SELECT display_name FROM users WHERE id = ?').get(c.challengerId);
+      incoming.push({
+        challenge_id: cid,
+        challenger_id: c.challengerId,
+        challenger_name: challengerName?.display_name || null,
+        beast_name: c.challengerBeastName,
+      });
+    } else if (c.challengerId === userId) {
+      outgoing.push({
+        challenge_id: cid,
+        opponent_id: c.opponentId,
+        status: c.status,
+        battle_id: c.battleId || null,
+      });
+    }
+  }
+  res.json({ incoming, outgoing });
+});
+
+app.post('/battle/pvp/accept', (req, res) => {
+  const opponentId = req.headers['x-user-id'];
+  if (!opponentId) return res.status(401).json({ error: 'no user' });
+  const { challenge_id, my_beast_id } = req.body || {};
+  if (!challenge_id || !my_beast_id) return res.status(400).json({ error: 'challenge_id and my_beast_id required' });
+
+  const challenge = pvpChallengesMap.get(challenge_id);
+  if (!challenge || challenge.opponentId !== opponentId || challenge.status !== 'pending') return res.status(404).json({ error: 'challenge not found' });
+
+  const myBeast = db.prepare(`
+    SELECT bi.*, ce.name AS current_name, ce.image_url AS current_image
+    FROM beast_instances bi
+    JOIN creature_evolutions ce ON ce.base_creature_id = bi.base_creature_id AND ce.stage = bi.stage
+    WHERE bi.id = ? AND bi.user_id = ?
+  `).get(my_beast_id, opponentId);
+  if (!myBeast) return res.status(404).json({ error: 'beast not found' });
+
+  const challengerBeast = db.prepare(`
+    SELECT bi.id, bi.user_id, bi.base_creature_id, bi.stage, bi.level, ce.name AS current_name, ce.image_url AS current_image
+    FROM beast_instances bi
+    JOIN creature_evolutions ce ON ce.base_creature_id = bi.base_creature_id AND ce.stage = bi.stage
+    WHERE bi.id = ? AND bi.user_id = ?
+  `).get(challenge.challengerBeastId, challenge.challengerId);
+  if (!challengerBeast) return res.status(400).json({ error: 'challenger beast not found' });
+  const creature = db.prepare('SELECT id, name, image_url, rarity, type FROM creatures WHERE id = ?').get(challengerBeast.base_creature_id);
+
+  const myStats = battleStats(myBeast.level, myBeast.stage);
+  const oppStats = battleStats(challengerBeast.level, challengerBeast.stage);
+
+  const battleId = uuid();
+  const battle = {
+    battleId,
+    challengerId: challenge.challengerId,
+    opponentId,
+    myBeastId: challengerBeast.id,
+    opponentBeastId: myBeast.id,
+    myHP: oppStats.hp,
+    myMaxHP: oppStats.hp,
+    opponentHP: myStats.hp,
+    opponentMaxHP: myStats.hp,
+    myAtk: oppStats.atk,
+    myDef: oppStats.def,
+    opponentAtk: myStats.atk,
+    opponentDef: myStats.def,
+    myHealCount: 0,
+    opponentHealCount: 0,
+    turn: 'challenger',
+    createdAt: Date.now(),
+  };
+  pvpBattleMap.set(battleId, battle);
+  challenge.status = 'accepted';
+  challenge.battleId = battleId;
+  pruneExpiredPvpBattles();
+
+  res.json({
+    battle_id: battleId,
+    player_hp: battle.opponentHP,
+    player_max_hp: battle.opponentMaxHP,
+    wild_hp: battle.myHP,
+    wild_max_hp: battle.myMaxHP,
+    wild_creature: { ...creature, name: challengerBeast.current_name, image_url: challengerBeast.current_image },
+    beast_name: myBeast.current_name,
+    beast_image: myBeast.current_image,
+    is_challenger: false,
+    turn: 'opponent',
+  });
+});
+
+app.get('/battle/pvp/:battleId/state', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'no user' });
+  const battle = pvpBattleMap.get(req.params.battleId);
+  if (!battle) return res.status(404).json({ error: 'battle not found' });
+  const isChallenger = battle.challengerId === userId;
+  if (!isChallenger && battle.opponentId !== userId) return res.status(403).json({ error: 'not in this battle' });
+  const playerHp = isChallenger ? battle.myHP : battle.opponentHP;
+  const playerMaxHp = isChallenger ? battle.myMaxHP : battle.opponentMaxHP;
+  const wildHp = isChallenger ? battle.opponentHP : battle.myHP;
+  const wildMaxHp = isChallenger ? battle.opponentMaxHP : battle.myMaxHP;
+  const myBeastId = isChallenger ? battle.myBeastId : battle.opponentBeastId;
+  const oppBeastId = isChallenger ? battle.opponentBeastId : battle.myBeastId;
+  const myBeast = db.prepare('SELECT bi.*, ce.name AS current_name, ce.image_url AS current_image FROM beast_instances bi JOIN creature_evolutions ce ON ce.base_creature_id = bi.base_creature_id AND ce.stage = bi.stage WHERE bi.id = ?').get(myBeastId);
+  const oppBeast = db.prepare('SELECT bi.*, ce.name AS current_name, ce.image_url AS current_image FROM beast_instances bi JOIN creature_evolutions ce ON ce.base_creature_id = bi.base_creature_id AND ce.stage = bi.stage WHERE bi.id = ?').get(oppBeastId);
+  const wildCreature = oppBeast ? { id: oppBeast.base_creature_id, name: oppBeast.current_name, image_url: oppBeast.current_image, rarity: 'common', type: '' } : null;
+  res.json({
+    player_hp: playerHp,
+    player_max_hp: playerMaxHp,
+    wild_hp: wildHp,
+    wild_max_hp: wildMaxHp,
+    turn: battle.turn || 'challenger',
+    is_challenger: isChallenger,
+    beast_name: myBeast?.current_name ?? '',
+    beast_image: myBeast?.current_image ?? '',
+    wild_creature: wildCreature,
+  });
+});
+
+app.post('/battle/pvp/turn', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'no user' });
+  const { battle_id, action } = req.body || {};
+  if (!battle_id || !action) return res.status(400).json({ error: 'battle_id and action required' });
+  if (!['attack', 'power', 'heal'].includes(action)) return res.status(400).json({ error: 'action must be attack, power, or heal' });
+
+  const battle = pvpBattleMap.get(battle_id);
+  if (!battle) return res.status(404).json({ error: 'battle not found' });
+  const isChallenger = battle.challengerId === userId;
+  const isOpponent = battle.opponentId === userId;
+  if (!isChallenger && !isOpponent) return res.status(403).json({ error: 'not in this battle' });
+
+  if (battle.turn) {
+    const myTurn = (isChallenger && battle.turn === 'challenger') || (isOpponent && battle.turn === 'opponent');
+    if (!myTurn) return res.status(400).json({ error: 'not your turn' });
+  } else if (!isChallenger) {
+    return res.status(403).json({ error: 'not in this battle' });
+  }
+
+  const log = [];
+  const isReal2P = !!battle.turn;
+
+  if (isReal2P && isOpponent) {
+    // Opponent's move: damage/heal opponent's own HP (myHP from battle = challenger's HP, opponentHP = opponent's)
+    if (action === 'heal') {
+      if (battle.opponentHealCount >= 2) return res.status(400).json({ error: 'no heals left' });
+      const amount = Math.floor(battle.opponentMaxHP * 0.3);
+      battle.opponentHP = Math.min(battle.opponentMaxHP, battle.opponentHP + amount);
+      battle.opponentHealCount++;
+      log.push(`You heal for ${amount} HP.`);
+    } else {
+      let damage = battleDamage(battle.opponentAtk, battle.myDef);
+      if (action === 'power') {
+        if (Math.random() > 0.7) { damage = 0; log.push('Power Strike missed!'); } else { damage = Math.floor(damage * 1.5); log.push(`Power Strike hits for ${damage} damage!`); }
+      } else log.push(`You attack for ${damage} damage!`);
+      if (damage > 0) battle.myHP = Math.max(0, battle.myHP - damage);
+    }
+    battle.turn = 'challenger';
+  } else {
+    // Challenger's move (or instant AI flow)
+    if (action === 'heal') {
+      if (battle.myHealCount >= 2) return res.status(400).json({ error: 'no heals left' });
+      const amount = Math.floor(battle.myMaxHP * 0.3);
+      battle.myHP = Math.min(battle.myMaxHP, battle.myHP + amount);
+      battle.myHealCount++;
+      log.push(`You heal for ${amount} HP.`);
+    } else {
+      let damage = battleDamage(battle.myAtk, battle.opponentDef);
+      if (action === 'power') {
+        if (Math.random() > 0.7) {
+          damage = 0;
+          log.push('Power Strike missed!');
+        } else {
+          damage = Math.floor(damage * 1.5);
+          log.push(`Power Strike hits for ${damage} damage!`);
+        }
+      } else {
+        log.push(`You attack for ${damage} damage!`);
+      }
+      if (damage > 0) battle.opponentHP = Math.max(0, battle.opponentHP - damage);
+    }
+    if (isReal2P) battle.turn = 'opponent';
+  }
+
+  let result = null;
+
+  if (battle.opponentHP <= 0) {
+    pvpBattleMap.delete(battle_id);
+    const PVP_WIN_XP = 50;
+    const PVP_WIN_COINS = 25;
+    awardXP(userId, PVP_WIN_XP);
+    db.prepare('UPDATE player_stats SET coins = coins + ? WHERE user_id = ?').run(PVP_WIN_COINS, userId);
+    result = { winner: 'player', xp: PVP_WIN_XP, coins: PVP_WIN_COINS };
+  } else if (isReal2P && isOpponent && battle.myHP <= 0) {
+    pvpBattleMap.delete(battle_id);
+    const PVP_WIN_XP = 50;
+    const PVP_WIN_COINS = 25;
+    awardXP(userId, PVP_WIN_XP);
+    db.prepare('UPDATE player_stats SET coins = coins + ? WHERE user_id = ?').run(PVP_WIN_COINS, userId);
+    result = { winner: 'player', xp: PVP_WIN_XP, coins: PVP_WIN_COINS };
+  } else if (!isReal2P) {
+    // Opponent (AI) turn
+    const oppAction = pickOpponentAction(battle);
+    if (oppAction === 'heal') {
+      const amount = Math.floor(battle.opponentMaxHP * 0.3);
+      battle.opponentHP = Math.min(battle.opponentMaxHP, battle.opponentHP + amount);
+      battle.opponentHealCount++;
+      log.push('Opponent heals!');
+    } else {
+      let damage = battleDamage(battle.opponentAtk, battle.myDef);
+      if (oppAction === 'power' && Math.random() <= 0.7) damage = Math.floor(damage * 1.5);
+      if (damage > 0) {
+        battle.myHP = Math.max(0, battle.myHP - damage);
+        log.push(`Opponent attacks for ${damage} damage!`);
+      }
+    }
+    if (battle.myHP <= 0) {
+      pvpBattleMap.delete(battle_id);
+      result = { winner: 'wild' };
+    }
+  }
+
+  const resPlayerHp = isChallenger ? battle.myHP : battle.opponentHP;
+  const resPlayerMaxHp = isChallenger ? battle.myMaxHP : battle.opponentMaxHP;
+  const resWildHp = isChallenger ? battle.opponentHP : battle.myHP;
+  const resWildMaxHp = isChallenger ? battle.opponentMaxHP : battle.myMaxHP;
+
+  res.json({
+    player_hp: resPlayerHp,
+    player_max_hp: resPlayerMaxHp,
+    wild_hp: resWildHp,
+    wild_max_hp: resWildMaxHp,
+    log,
+    result,
+  });
+});
+
 // ── Health endpoint ─────────────────────────────────────────
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: API_VERSION, timestamp: new Date().toISOString() });
 });
 
 // ── Global error handler ────────────────────────────────────
@@ -793,4 +1540,8 @@ app.use((err, _req, res, _next) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log('Server on http://localhost:' + PORT));
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, () => console.log('Server on http://localhost:' + PORT));
+}
+
+export { app };

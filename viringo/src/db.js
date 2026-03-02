@@ -142,6 +142,46 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_daily_distance_user_date ON daily_distance(user_id, date);
+
+  -- Shop: items, user inventory, active timed effects
+  CREATE TABLE IF NOT EXISTS shop_items (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    price INTEGER NOT NULL,
+    effect_type TEXT NOT NULL,
+    duration_min INTEGER,
+    image_url TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS inventory (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    item_id TEXT NOT NULL REFERENCES shop_items(id),
+    quantity INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(user_id, item_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS active_effects (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    effect_type TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS friends (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    friend_id TEXT NOT NULL REFERENCES users(id),
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(user_id, friend_id),
+    CHECK(user_id != friend_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_inventory_user ON inventory(user_id);
+  CREATE INDEX IF NOT EXISTS idx_active_effects_user_expires ON active_effects(user_id, expires_at);
+  CREATE INDEX IF NOT EXISTS idx_friends_user ON friends(user_id);
+  CREATE INDEX IF NOT EXISTS idx_friends_friend ON friends(friend_id);
 `);
 
 // Migrate: add display_name if upgrading from older schema

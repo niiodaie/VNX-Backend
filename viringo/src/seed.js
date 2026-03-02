@@ -83,6 +83,15 @@ const questDefs = [
   { id: 'q-walk-3k',        title: 'Explorer',        description: 'Walk 3 kilometers',           type: 'walk_distance', target_value: null,      required: 3000, xp_reward: 250, coin_reward: 50 },
 ];
 
+// ── Shop items ───────────────────────────────────────────────
+
+const shopItems = [
+  { id: 'item-lure',        name: 'Lure',         description: '2x spawns in your area for 30 min',     price: 50,  effect_type: 'lure',        duration_min: 30, image_url: null },
+  { id: 'item-incense',     name: 'Incense',      description: 'Boost rare/legendary spawn chance for 30 min', price: 80,  effect_type: 'incense',     duration_min: 30, image_url: null },
+  { id: 'item-lucky-charm', name: 'Lucky Charm',  description: '2x XP from catches for 30 min',          price: 60,  effect_type: 'lucky_charm', duration_min: 30, image_url: null },
+  { id: 'item-rare-egg',    name: 'Rare Egg',     description: 'Instantly grants a random uncommon+ creature', price: 100, effect_type: 'rare_egg',  duration_min: null, image_url: null },
+];
+
 // ── Auto-rolling season (one per calendar month) ─────────────
 
 const SEASON_THEMES = [
@@ -129,6 +138,14 @@ function seed() {
     insQuest.run(q.id, q.title, q.description, q.type, q.target_value, q.required, q.xp_reward, q.coin_reward);
   }
   console.log('Seeded', questDefs.length, 'quest definitions.');
+
+  const insShopItem = db.prepare(
+    'INSERT OR REPLACE INTO shop_items (id, name, description, price, effect_type, duration_min, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  );
+  for (const s of shopItems) {
+    insShopItem.run(s.id, s.name, s.description, s.price, s.effect_type, s.duration_min, s.image_url);
+  }
+  console.log('Seeded', shopItems.length, 'shop items.');
 
   // Auto-rolling season for the current month
   const season = currentSeasonDef();
