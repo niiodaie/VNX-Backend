@@ -1,11 +1,4 @@
 
-import express from 'express';
-import cors from 'cors';
-import { v4 as uuid } from 'uuid';
-import db from './db.js';
-
-const app = express();
-
 // Allow configured frontends; default to known production/staging domains.
 const defaultOrigins = [
   'https://viringo.pro',
