@@ -1,4 +1,20 @@
+import express from 'express';
+import cors from 'cors';
+import { v4 as uuid } from 'uuid';
+import db from './db.js';
 
+const app = express();
+
+// TEMP: allow all origins to verify CORS quickly
+app.use(
+  cors({
+    origin: true,          // reflect request origin
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'X-User-Id'],
+  }),
+);
+
+app.use(express.json());
 // Allow configured frontends; default to known production/staging domains.
 const defaultOrigins = [
   'https://viringo.pro',
