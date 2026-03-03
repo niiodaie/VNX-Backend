@@ -8,6 +8,7 @@ const dbPath = process.env.DATABASE_PATH || join(__dirname, '..', 'data', 'creat
 const db = new Database(dbPath);
 
 db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = OFF'); // catches.spawn_id → spawns(id) is deleted after insert; keep FK off to avoid constraint error
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (

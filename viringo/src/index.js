@@ -319,72 +319,81 @@ app.get('/spawns', (req, res) => {
 });
 
 app.post('/catch', (req, res) => {
-  const userId = getOrCreateUserId(req);
-  const { spawn_id, creature_id, lat, lng } = req.body || {};
-  if (!creature_id && !spawn_id) return res.status(400).json({ error: 'spawn_id or creature_id required' });
+  try {
+    const userId = getOrCreateUserId(req);
+    const { spawn_id, creature_id, lat, lng } = req.body || {};
+    if (!creature_id && !spawn_id) return res.status(400).json({ error: 'spawn_id or creature_id required' });
 
-  let creatureId = creature_id;
-  if (spawn_id) {
-    const spawn = db.prepare('SELECT creature_id FROM spawns WHERE id = ?').get(spawn_id);
-    if (!spawn) return res.status(404).json({ error: 'spawn not found' });
-    creatureId = spawn.creature_id;
-  }
-
-  const validCreature = db.prepare('SELECT id FROM creatures WHERE id = ?').get(creatureId);
-  if (!validCreature) return res.status(400).json({ error: 'invalid creature_id' });
-
-  db.prepare('INSERT INTO catches (id, user_id, creature_id, spawn_id, lat, lng) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(uuid(), userId, creatureId, spawn_id || null, lat ?? null, lng ?? null);
-
-  // Remove the spawn so it can't be caught again
-  if (spawn_id) {
-    db.prepare('DELETE FROM spawns WHERE id = ?').run(spawn_id);
-  }
-
-  const creature = db.prepare('SELECT id, name, image_url, rarity, type FROM creatures WHERE id = ?').get(creatureId);
-  let xp = XP_PER_CATCH[creature.rarity] ?? 20;
-  if (getActiveEffects(userId).lucky_charm) xp *= 2;
-  const statsUpdate = awardXP(userId, xp);
-  updateQuestProgress(userId, creature);
-
-  // Award season points if an active season exists
-  const activeSeason = getCurrentSeason();
-  let seasonPoints = null;
-  if (activeSeason) {
-    const pts = SEASON_PTS[creature.rarity] ?? 1;
-    const existing = db.prepare('SELECT * FROM season_entries WHERE season_id = ? AND user_id = ?').get(activeSeason.id, userId);
-    if (existing) {
-      db.prepare(`UPDATE season_entries SET points = points + ?, updated_at = datetime('now') WHERE season_id = ? AND user_id = ?`)
-        .run(pts, activeSeason.id, userId);
-      seasonPoints = existing.points + pts;
-    } else {
-      db.prepare('INSERT INTO season_entries (id, season_id, user_id, points) VALUES (?, ?, ?, ?)')
-        .run(uuid(), activeSeason.id, userId, pts);
-      seasonPoints = pts;
+    let creatureId = creature_id;
+    if (spawn_id) {
+      const spawn = db.prepare('SELECT creature_id FROM spawns WHERE id = ?').get(spawn_id);
+      if (!spawn) return res.status(404).json({ error: 'spawn not found' });
+      creatureId = spawn.creature_id;
     }
-  }
 
-  // Update or create beast instance
-  const existingBeast = db.prepare('SELECT * FROM beast_instances WHERE user_id = ? AND base_creature_id = ?').get(userId, creatureId);
-  let beastInstance;
-  if (existingBeast) {
-    const newXp = Math.min(existingBeast.beast_xp + BEAST_XP_PER_CATCH, (MAX_BEAST_LEVEL - 1) * BEAST_XP_PER_LEVEL);
-    const newLevel = beastLevelFromXp(newXp);
-    db.prepare('UPDATE beast_instances SET beast_xp = ?, level = ? WHERE id = ?')
-      .run(newXp, newLevel, existingBeast.id);
-    beastInstance = { ...existingBeast, beast_xp: newXp, level: newLevel };
-  } else {
-    const newXp = BEAST_XP_PER_CATCH;
-    const newLevel = beastLevelFromXp(newXp);
-    const beastId = uuid();
-    db.prepare('INSERT INTO beast_instances (id, user_id, base_creature_id, stage, level, beast_xp) VALUES (?, ?, ?, 1, ?, ?)')
-      .run(beastId, userId, creatureId, newLevel, newXp);
-    beastInstance = { id: beastId, user_id: userId, base_creature_id: creatureId, stage: 1, level: newLevel, beast_xp: newXp };
-  }
-  const canEvolve = (EVOLVE_LEVELS[beastInstance.stage] ?? Infinity) <= beastInstance.level;
+    const validCreature = db.prepare('SELECT id FROM creatures WHERE id = ?').get(creatureId);
+    if (!validCreature) return res.status(400).json({ error: 'invalid creature_id' });
 
-  const updatedStats = getOrCreateStats(userId);
-  res.status(201).json({ creature, user_id: userId, ...statsUpdate, coins: updatedStats.coins, beastInstance, canEvolve, seasonPoints });
+    // Delete spawn BEFORE inserting catch to avoid FK constraint issues if enforcement is on
+    if (spawn_id) {
+      db.prepare('DELETE FROM spawns WHERE id = ?').run(spawn_id);
+    }
+
+    db.prepare('INSERT INTO catches (id, user_id, creature_id, spawn_id, lat, lng) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(uuid(), userId, creatureId, spawn_id || null, lat ?? null, lng ?? null);
+
+    const creature = db.prepare('SELECT id, name, image_url, rarity, type FROM creatures WHERE id = ?').get(creatureId);
+    if (!creature) return res.status(400).json({ error: 'creature not found after catch' });
+
+    let xp = XP_PER_CATCH[creature.rarity] ?? 20;
+    if (getActiveEffects(userId).lucky_charm) xp *= 2;
+    const statsUpdate = awardXP(userId, xp);
+    updateQuestProgress(userId, creature);
+
+    // Award season points if an active season exists
+    const activeSeason = getCurrentSeason();
+    let seasonPoints = null;
+    if (activeSeason) {
+      const pts = SEASON_PTS[creature.rarity] ?? 1;
+      const existing = db.prepare('SELECT * FROM season_entries WHERE season_id = ? AND user_id = ?').get(activeSeason.id, userId);
+      if (existing) {
+        db.prepare(`UPDATE season_entries SET points = points + ?, updated_at = datetime('now') WHERE season_id = ? AND user_id = ?`)
+          .run(pts, activeSeason.id, userId);
+        seasonPoints = existing.points + pts;
+      } else {
+        db.prepare('INSERT OR IGNORE INTO season_entries (id, season_id, user_id, points) VALUES (?, ?, ?, ?)')
+          .run(uuid(), activeSeason.id, userId, pts);
+        const inserted = db.prepare('SELECT points FROM season_entries WHERE season_id = ? AND user_id = ?').get(activeSeason.id, userId);
+        seasonPoints = inserted?.points ?? pts;
+      }
+    }
+
+    // Update or create beast instance
+    const existingBeast = db.prepare('SELECT * FROM beast_instances WHERE user_id = ? AND base_creature_id = ?').get(userId, creatureId);
+    let beastInstance;
+    if (existingBeast) {
+      const newXp = Math.min(existingBeast.beast_xp + BEAST_XP_PER_CATCH, (MAX_BEAST_LEVEL - 1) * BEAST_XP_PER_LEVEL);
+      const newLevel = beastLevelFromXp(newXp);
+      db.prepare('UPDATE beast_instances SET beast_xp = ?, level = ? WHERE id = ?')
+        .run(newXp, newLevel, existingBeast.id);
+      beastInstance = { ...existingBeast, beast_xp: newXp, level: newLevel };
+    } else {
+      const newXp = BEAST_XP_PER_CATCH;
+      const newLevel = beastLevelFromXp(newXp);
+      const beastId = uuid();
+      db.prepare('INSERT OR IGNORE INTO beast_instances (id, user_id, base_creature_id, stage, level, beast_xp) VALUES (?, ?, ?, 1, ?, ?)')
+        .run(beastId, userId, creatureId, newLevel, newXp);
+      const saved = db.prepare('SELECT * FROM beast_instances WHERE user_id = ? AND base_creature_id = ?').get(userId, creatureId);
+      beastInstance = saved ?? { id: beastId, user_id: userId, base_creature_id: creatureId, stage: 1, level: newLevel, beast_xp: newXp };
+    }
+    const canEvolve = (EVOLVE_LEVELS[beastInstance.stage] ?? Infinity) <= beastInstance.level;
+
+    const updatedStats = getOrCreateStats(userId);
+    res.status(201).json({ creature, user_id: userId, ...statsUpdate, coins: updatedStats.coins, beastInstance, canEvolve, seasonPoints });
+  } catch (err) {
+    console.error('[POST /catch] Unhandled error:', err);
+    res.status(500).json({ error: 'Catch failed. Please try again.' });
+  }
 });
 
 app.get('/me/bestiary', (req, res) => {
@@ -1124,7 +1133,7 @@ app.post('/battle/turn', (req, res) => {
     const bonusCoins = { common: 5, uncommon: 10, rare: 20, legendary: 40 }[wildCreature.rarity] ?? 5;
     db.prepare('DELETE FROM spawns WHERE id = ?').run(battle.spawnId);
     db.prepare('INSERT INTO catches (id, user_id, creature_id, spawn_id, lat, lng) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(uuid(), userId, battle.wildCreatureId, battle.spawnId, null, null);
+      .run(uuid(), userId, battle.wildCreatureId, null, null, null);
     const creature = db.prepare('SELECT id, name, image_url, rarity, type FROM creatures WHERE id = ?').get(battle.wildCreatureId);
     updateQuestProgress(userId, creature);
     awardXP(userId, xp);
@@ -1135,7 +1144,7 @@ app.post('/battle/turn', (req, res) => {
       const newXp = Math.min(existingBeast.beast_xp + BEAST_XP_PER_CATCH, (MAX_BEAST_LEVEL - 1) * BEAST_XP_PER_LEVEL);
       db.prepare('UPDATE beast_instances SET beast_xp = ?, level = ? WHERE id = ?').run(newXp, beastLevelFromXp(newXp), existingBeast.id);
     } else {
-      db.prepare('INSERT INTO beast_instances (id, user_id, base_creature_id, stage, level, beast_xp) VALUES (?, ?, ?, 1, ?, ?)')
+      db.prepare('INSERT OR IGNORE INTO beast_instances (id, user_id, base_creature_id, stage, level, beast_xp) VALUES (?, ?, ?, 1, ?, ?)')
         .run(uuid(), userId, battle.wildCreatureId, beastLevelFromXp(BEAST_XP_PER_CATCH), BEAST_XP_PER_CATCH);
     }
     result = { winner: 'player', xp, coins: bonusCoins, creature: wildCreature };
