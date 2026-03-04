@@ -183,6 +183,21 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_active_effects_user_expires ON active_effects(user_id, expires_at);
   CREATE INDEX IF NOT EXISTS idx_friends_user ON friends(user_id);
   CREATE INDEX IF NOT EXISTS idx_friends_friend ON friends(friend_id);
+
+  -- Beast trades: one user offers a beast to a friend; friend accepts with one of their own
+  CREATE TABLE IF NOT EXISTS trades (
+    id TEXT PRIMARY KEY,
+    from_user_id  TEXT NOT NULL REFERENCES users(id),
+    to_user_id    TEXT NOT NULL REFERENCES users(id),
+    from_beast_id TEXT NOT NULL,
+    to_beast_id   TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_trades_from ON trades(from_user_id, status);
+  CREATE INDEX IF NOT EXISTS idx_trades_to   ON trades(to_user_id,   status);
 `);
 
 // Migrate: add display_name if upgrading from older schema

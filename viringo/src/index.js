@@ -1005,6 +1005,160 @@ app.post('/me/friends/:friendUserId/gift', (req, res) => {
   res.json({ ok: true, item_id });
 });
 
+// ── Trades ───────────────────────────────────────────────────
+
+const BEAST_TRADE_QUERY = `
+  SELECT
+    bi.id AS beast_id, bi.level,
+    ce.name AS beast_name, ce.image_url AS beast_image,
+    c.rarity, c.type
+  FROM beast_instances bi
+  JOIN creature_evolutions ce ON ce.base_creature_id = bi.base_creature_id AND ce.stage = bi.stage
+  JOIN creatures c ON c.id = bi.base_creature_id
+  WHERE bi.id = ?
+`;
+
+function buildTradeResponse(trade) {
+  const fromUser = db.prepare('SELECT display_name FROM users WHERE id = ?').get(trade.from_user_id);
+  const toUser   = db.prepare('SELECT display_name FROM users WHERE id = ?').get(trade.to_user_id);
+  const fromBeast = db.prepare(BEAST_TRADE_QUERY).get(trade.from_beast_id);
+  const toBeast   = trade.to_beast_id ? db.prepare(BEAST_TRADE_QUERY).get(trade.to_beast_id) : null;
+
+  return {
+    trade_id: trade.id,
+    from_user_id: trade.from_user_id,
+    from_display_name: fromUser?.display_name ?? null,
+    from_beast: fromBeast ? {
+      id: fromBeast.beast_id,
+      name: fromBeast.beast_name,
+      image_url: fromBeast.beast_image,
+      rarity: fromBeast.rarity,
+      type: fromBeast.type,
+      level: fromBeast.level,
+    } : null,
+    to_user_id: trade.to_user_id,
+    to_display_name: toUser?.display_name ?? null,
+    to_beast: toBeast ? {
+      id: toBeast.beast_id,
+      name: toBeast.beast_name,
+      image_url: toBeast.beast_image,
+      rarity: toBeast.rarity,
+      type: toBeast.type,
+      level: toBeast.level,
+    } : null,
+    status: trade.status,
+    created_at: trade.created_at,
+  };
+}
+
+// Transfer a beast to a new owner; merges XP if the target already owns the same species
+function transferBeast(beastId, newOwnerId) {
+  const beast = db.prepare('SELECT * FROM beast_instances WHERE id = ?').get(beastId);
+  if (!beast) return;
+  const existing = db.prepare(
+    'SELECT * FROM beast_instances WHERE user_id = ? AND base_creature_id = ? AND id != ?'
+  ).get(newOwnerId, beast.base_creature_id, beastId);
+
+  if (existing) {
+    const mergedXp    = Math.min(existing.beast_xp + beast.beast_xp, (MAX_BEAST_LEVEL - 1) * BEAST_XP_PER_LEVEL);
+    const mergedLevel = beastLevelFromXp(mergedXp);
+    db.prepare('UPDATE beast_instances SET beast_xp = ?, level = ? WHERE id = ?')
+      .run(mergedXp, mergedLevel, existing.id);
+    db.prepare('DELETE FROM beast_instances WHERE id = ?').run(beastId);
+  } else {
+    db.prepare('UPDATE beast_instances SET user_id = ? WHERE id = ?').run(newOwnerId, beastId);
+  }
+}
+
+app.get('/me/trades', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.json({ incoming: [], outgoing: [] });
+
+  const incoming = db.prepare(
+    "SELECT * FROM trades WHERE to_user_id = ? AND status = 'pending' ORDER BY created_at DESC"
+  ).all(userId);
+  const outgoing = db.prepare(
+    "SELECT * FROM trades WHERE from_user_id = ? AND status = 'pending' ORDER BY created_at DESC"
+  ).all(userId);
+
+  res.json({
+    incoming: incoming.map(buildTradeResponse),
+    outgoing: outgoing.map(buildTradeResponse),
+  });
+});
+
+app.post('/me/trades', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'no user' });
+  const { friend_user_id, beast_id } = req.body || {};
+  if (!friend_user_id || !beast_id) return res.status(400).json({ error: 'friend_user_id and beast_id required' });
+
+  const friendship = db.prepare('SELECT 1 FROM friends WHERE user_id = ? AND friend_id = ?').get(userId, friend_user_id);
+  if (!friendship) return res.status(403).json({ error: 'not friends with this user' });
+
+  const beast = db.prepare('SELECT * FROM beast_instances WHERE id = ? AND user_id = ?').get(beast_id, userId);
+  if (!beast) return res.status(404).json({ error: 'beast not found or not yours' });
+
+  const duplicate = db.prepare(
+    "SELECT id FROM trades WHERE from_user_id = ? AND from_beast_id = ? AND status = 'pending'"
+  ).get(userId, beast_id);
+  if (duplicate) return res.status(409).json({ error: 'you already have a pending trade with this beast' });
+
+  const tradeId = uuid();
+  db.prepare(
+    "INSERT INTO trades (id, from_user_id, to_user_id, from_beast_id, status) VALUES (?, ?, ?, ?, 'pending')"
+  ).run(tradeId, userId, friend_user_id, beast_id);
+
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(tradeId);
+  res.status(201).json(buildTradeResponse(trade));
+});
+
+app.post('/me/trades/:tradeId/accept', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'no user' });
+  const { beast_id } = req.body || {};
+  if (!beast_id) return res.status(400).json({ error: 'beast_id required' });
+
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(req.params.tradeId);
+  if (!trade) return res.status(404).json({ error: 'trade not found' });
+  if (trade.status !== 'pending') return res.status(400).json({ error: 'trade is not pending' });
+  if (trade.to_user_id !== userId) return res.status(403).json({ error: 'not your trade to accept' });
+
+  const myBeast = db.prepare('SELECT * FROM beast_instances WHERE id = ? AND user_id = ?').get(beast_id, userId);
+  if (!myBeast) return res.status(404).json({ error: 'beast not found or not yours' });
+
+  const fromBeastStillOwned = db.prepare(
+    'SELECT id FROM beast_instances WHERE id = ? AND user_id = ?'
+  ).get(trade.from_beast_id, trade.from_user_id);
+  if (!fromBeastStillOwned) return res.status(409).json({ error: 'the offered beast is no longer available' });
+
+  db.transaction(() => {
+    transferBeast(trade.from_beast_id, userId);
+    transferBeast(beast_id, trade.from_user_id);
+    db.prepare(
+      "UPDATE trades SET status = 'completed', to_beast_id = ?, updated_at = datetime('now') WHERE id = ?"
+    ).run(beast_id, trade.id);
+  })();
+
+  const updated = db.prepare('SELECT * FROM trades WHERE id = ?').get(trade.id);
+  res.json(buildTradeResponse(updated));
+});
+
+app.post('/me/trades/:tradeId/cancel', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'no user' });
+
+  const trade = db.prepare('SELECT * FROM trades WHERE id = ?').get(req.params.tradeId);
+  if (!trade) return res.status(404).json({ error: 'trade not found' });
+  if (trade.status !== 'pending') return res.status(400).json({ error: 'trade is not pending' });
+  if (trade.from_user_id !== userId && trade.to_user_id !== userId) {
+    return res.status(403).json({ error: 'not your trade' });
+  }
+
+  db.prepare("UPDATE trades SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?").run(trade.id);
+  res.status(204).send();
+});
+
 // ── Battle (in-memory state) ─────────────────────────────────
 
 const WILD_LEVEL_BY_RARITY = { common: 3, uncommon: 6, rare: 9, legendary: 12 };
